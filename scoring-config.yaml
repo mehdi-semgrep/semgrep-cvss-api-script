@@ -36,6 +36,18 @@ cvss:
       HIGH: 1.00
       MEDIUM: 0.92
       LOW: 0.85
+  external_lookup:
+    enabled: true
+    provider_order: ["nvd"]
+    cache_file: ".cvss_cache.json"
+    nvd:
+      api_url: "https://services.nvd.nist.gov/rest/json/cves/2.0"
+      api_key_env: "NVD_API_KEY"
+      timeout_seconds: 8
+      max_attempts: 4
+      backoff_ms: 500
+      max_backoff_ms: 6000
+      retry_statuses: [429, 500, 502, 503, 504]
 
 epss:
   fallback_to_first: true

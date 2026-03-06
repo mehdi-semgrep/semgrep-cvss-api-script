@@ -169,6 +169,16 @@ def get_required(mapping: Dict[str, Any], key: str, section: str) -> Any:
     return mapping[key]
 
 
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
 def validate_and_finalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     semgrep = get_required(config, "semgrep", "root")
     cvss_cfg = get_required(config, "cvss", "root")
@@ -252,6 +262,49 @@ def validate_and_finalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     confidence_adj = inference_overrides["confidence_adjustment"]
     for k, v in list(confidence_adj.items()):
         confidence_adj[str(k).upper()] = float(v)
+
+    external_lookup = cvss_cfg.setdefault("external_lookup", {})
+    if not isinstance(external_lookup, dict):
+        raise CliValidationError("'cvss.external_lookup' must be a mapping")
+    external_lookup.setdefault("enabled", False)
+    external_lookup["enabled"] = parse_bool(external_lookup["enabled"])
+    external_lookup.setdefault("provider_order", ["nvd"])
+    if not isinstance(external_lookup["provider_order"], list) or not external_lookup["provider_order"]:
+        raise CliValidationError("'cvss.external_lookup.provider_order' must be a non-empty list")
+    providers = [str(item).strip().lower() for item in external_lookup["provider_order"] if str(item).strip()]
+    if not providers:
+        raise CliValidationError("'cvss.external_lookup.provider_order' must contain at least one provider")
+    unsupported = [name for name in providers if name != "nvd"]
+    if unsupported:
+        raise CliValidationError(
+            f"Unsupported CVSS external providers: {', '.join(sorted(set(unsupported)))}"
+        )
+    external_lookup["provider_order"] = providers
+    external_lookup.setdefault("cache_file", ".cvss_cache.json")
+    if not isinstance(external_lookup["cache_file"], str) or not external_lookup["cache_file"].strip():
+        raise CliValidationError("'cvss.external_lookup.cache_file' must be a non-empty string")
+
+    nvd_cfg = external_lookup.setdefault("nvd", {})
+    if not isinstance(nvd_cfg, dict):
+        raise CliValidationError("'cvss.external_lookup.nvd' must be a mapping")
+    nvd_cfg.setdefault("api_url", "https://services.nvd.nist.gov/rest/json/cves/2.0")
+    nvd_cfg.setdefault("api_key_env", "NVD_API_KEY")
+    nvd_cfg.setdefault("timeout_seconds", 8)
+    nvd_cfg.setdefault("max_attempts", 4)
+    nvd_cfg.setdefault("backoff_ms", 500)
+    nvd_cfg.setdefault("max_backoff_ms", 6000)
+    nvd_cfg.setdefault("retry_statuses", [429, 500, 502, 503, 504])
+    if not isinstance(nvd_cfg["api_url"], str) or not nvd_cfg["api_url"].strip():
+        raise CliValidationError("'cvss.external_lookup.nvd.api_url' must be a non-empty string")
+    if not isinstance(nvd_cfg["api_key_env"], str) or not nvd_cfg["api_key_env"].strip():
+        raise CliValidationError("'cvss.external_lookup.nvd.api_key_env' must be a non-empty string")
+    for key in ("timeout_seconds", "max_attempts", "backoff_ms", "max_backoff_ms"):
+        nvd_cfg[key] = int(nvd_cfg[key])
+        if nvd_cfg[key] <= 0:
+            raise CliValidationError(f"'cvss.external_lookup.nvd.{key}' must be > 0")
+    if not isinstance(nvd_cfg["retry_statuses"], list) or not nvd_cfg["retry_statuses"]:
+        raise CliValidationError("'cvss.external_lookup.nvd.retry_statuses' must be a non-empty list")
+    nvd_cfg["retry_statuses"] = [int(code) for code in nvd_cfg["retry_statuses"]]
 
     epss_cfg.setdefault("fallback_to_first", True)
     epss_cfg.setdefault("first_api_url", "https://api.first.org/data/v1/epss")
@@ -738,6 +791,183 @@ def resolve_findings_path(findings_path: str, deployment_slug: str) -> str:
     return findings_path
 
 
+def extract_cvss_vector_from_nvd_payload(payload: Dict[str, Any], version: str) -> Optional[str]:
+    vulnerabilities = payload.get("vulnerabilities")
+    if not isinstance(vulnerabilities, list):
+        return None
+    for vulnerability in vulnerabilities:
+        if not isinstance(vulnerability, dict):
+            continue
+        cve = vulnerability.get("cve")
+        if not isinstance(cve, dict):
+            continue
+        metrics = cve.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        for metric_family in ("cvssMetricV31", "cvssMetricV30"):
+            rows = metrics.get(metric_family)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                vector = json_get_path(row, "cvssData.vectorString") or row.get("vectorString")
+                if not vector:
+                    continue
+                try:
+                    normalized = normalize_cvss_vector(str(vector), version)
+                    validate_cvss_vector(normalized)
+                    return normalized
+                except Exception:
+                    continue
+    return None
+
+
+class CvssExternalResolver:
+    def __init__(self, cvss_cfg: Dict[str, Any], logger: logging.Logger, config_dir: Path) -> None:
+        self.logger = logger
+        external_cfg = cvss_cfg.get("external_lookup", {})
+        self.enabled = bool(external_cfg.get("enabled", False))
+        self.provider_order = list(external_cfg.get("provider_order", []))
+        self.version = str(cvss_cfg.get("version", "3.1"))
+        self.nvd_cfg = dict(external_cfg.get("nvd", {}))
+        cache_file = str(external_cfg.get("cache_file", ".cvss_cache.json"))
+        cache_path = Path(cache_file)
+        if not cache_path.is_absolute():
+            cache_path = (config_dir / cache_path).resolve()
+        self.cache_path = cache_path
+        self.cache_entries: Dict[str, Dict[str, Any]] = {}
+        self.cache_dirty = False
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        if not self.enabled or not self.cache_path.exists():
+            return
+        try:
+            with self.cache_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            self.logger.warning("CVSS cache unreadable (%s), ignoring: %s", self.cache_path, exc)
+            return
+        if not isinstance(payload, dict):
+            return
+        entries = payload.get("entries")
+        if isinstance(entries, dict):
+            self.cache_entries = entries
+
+    def persist_cache(self) -> None:
+        if not self.enabled or not self.cache_dirty:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "entries": self.cache_entries,
+        }
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{self.cache_path.name}.",
+            suffix=".tmp",
+            dir=str(self.cache_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.write("\n")
+            os.replace(temp_path, self.cache_path)
+            self.cache_dirty = False
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def resolve(self, cve: Optional[str]) -> Tuple[Optional[str], str]:
+        if not self.enabled or not cve:
+            return None, "none"
+        normalized_cve = str(cve).upper().strip()
+        if not normalized_cve:
+            return None, "none"
+
+        cached = self.cache_entries.get(normalized_cve)
+        if isinstance(cached, dict):
+            vector = cached.get("vector")
+            source = str(cached.get("source") or "none")
+            if isinstance(vector, str) and vector:
+                return vector, source
+            return None, "none"
+
+        vector: Optional[str] = None
+        source = "none"
+        for provider in self.provider_order:
+            if provider == "nvd":
+                vector = self._lookup_nvd_vector(normalized_cve)
+                source = "nvd" if vector else "none"
+                break
+
+        self.cache_entries[normalized_cve] = {
+            "vector": vector,
+            "source": source,
+            "updated_at": int(time.time()),
+        }
+        self.cache_dirty = True
+        return vector, source
+
+    def _lookup_nvd_vector(self, cve: str) -> Optional[str]:
+        url = str(self.nvd_cfg["api_url"])
+        params = {"cveId": cve}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "semgrep-cvss-cli/1.0",
+        }
+        api_key_env = str(self.nvd_cfg.get("api_key_env") or "").strip()
+        api_key = os.getenv(api_key_env, "").strip() if api_key_env else ""
+        if api_key:
+            headers["apiKey"] = api_key
+
+        max_attempts = int(self.nvd_cfg["max_attempts"])
+        retry_statuses = set(int(code) for code in self.nvd_cfg["retry_statuses"])
+        timeout_seconds = int(self.nvd_cfg["timeout_seconds"])
+        backoff_ms = int(self.nvd_cfg["backoff_ms"])
+        max_backoff_ms = int(self.nvd_cfg["max_backoff_ms"])
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = _requests.get(url, params=params, headers=headers, timeout=timeout_seconds)
+            except Exception as exc:
+                if attempt < max_attempts:
+                    self._sleep_backoff(attempt, backoff_ms, max_backoff_ms)
+                    continue
+                self.logger.debug("NVD lookup failed for %s: %s", cve, exc)
+                return None
+
+            if response.status_code in retry_statuses and attempt < max_attempts:
+                self._sleep_backoff(attempt, backoff_ms, max_backoff_ms)
+                continue
+            if response.status_code in (401, 403):
+                self.logger.warning(
+                    "NVD lookup unauthorized for %s (status=%s); check NVD API key if configured",
+                    cve,
+                    response.status_code,
+                )
+                return None
+            if response.status_code >= 400:
+                self.logger.debug("NVD lookup non-success for %s (status=%s)", cve, response.status_code)
+                return None
+
+            try:
+                payload = response.json()
+            except Exception:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            return extract_cvss_vector_from_nvd_payload(payload, self.version)
+        return None
+
+    @staticmethod
+    def _sleep_backoff(attempt: int, backoff_ms: int, max_backoff_ms: int) -> None:
+        raw_ms = min(max_backoff_ms, backoff_ms * (2 ** (attempt - 1)))
+        jittered_ms = max(1, int(raw_ms * random.uniform(0.7, 1.3)))
+        time.sleep(jittered_ms / 1000.0)
+
+
 def extract_official_cvss_vector(
     finding: Dict[str, Any], candidate_paths: Sequence[str], version: str
 ) -> Optional[str]:
@@ -904,6 +1134,7 @@ def derive_confidence(
 
 def build_rationale(
     scoring_method: str,
+    cvss_source: str,
     overrides: Sequence[str],
     epss_source: str,
     profile_name: str,
@@ -913,7 +1144,7 @@ def build_rationale(
     override_text = ",".join(overrides) if overrides else "none"
     method_text = "official" if scoring_method == "official_cvss" else "inferred"
     return (
-        f"method={method_text}; overrides={override_text}; epss={epss_source}; "
+        f"method={method_text}; cvss_source={cvss_source}; overrides={override_text}; epss={epss_source}; "
         f"profile={profile_name}; top={top}"
     )
 
@@ -927,6 +1158,7 @@ def process_finding(
     finding: Dict[str, Any],
     config: Dict[str, Any],
     client: HttpClient,
+    cvss_external_resolver: CvssExternalResolver,
     logger: logging.Logger,
 ) -> Dict[str, Any]:
     cvss_cfg = config["cvss"]
@@ -948,6 +1180,12 @@ def process_finding(
         cvss_cfg["official_cvss_candidate_paths"],
         cvss_cfg["version"],
     )
+    cvss_source = "semgrep" if official_vector else "inferred"
+    if not official_vector and cve:
+        external_vector, external_source = cvss_external_resolver.resolve(cve)
+        if external_vector:
+            official_vector = external_vector
+            cvss_source = external_source
     applied_overrides: List[str] = []
     confidence_multiplier: Optional[float] = None
 
@@ -1001,6 +1239,7 @@ def process_finding(
     confidence = derive_confidence(scoring_method, epss_source, profile_name, applied_overrides)
     rationale = build_rationale(
         scoring_method,
+        cvss_source,
         applied_overrides,
         epss_source,
         profile_name,
@@ -1079,7 +1318,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         if args.page_size is not None and (args.page_size <= 0 or args.page_size > 3000):
             raise CliValidationError("--page-size must be in range 1..3000")
 
-        config = validate_and_finalize_config(load_config(Path(args.config)))
+        config_path = Path(args.config)
+        config = validate_and_finalize_config(load_config(config_path))
         auth_env_var = str(config["semgrep"].get("auth_env_var", "SEMGREP_APP_TOKEN")).strip()
         token = os.getenv(auth_env_var, "").strip()
         if not token:
@@ -1106,6 +1346,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             retry_cfg=config["semgrep"]["retry"],
             logger=logger,
         )
+        cvss_external_resolver = CvssExternalResolver(
+            cvss_cfg=config["cvss"],
+            logger=logger,
+            config_dir=config_path.parent.resolve(),
+        )
 
         findings_template = str(config["semgrep"]["findings_path"])
         if "{deployment_slug}" in findings_template:
@@ -1131,11 +1376,12 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
         records: List[Dict[str, Any]] = []
         for finding in raw_findings:
-            scored = process_finding(finding, config, client, logger)
+            scored = process_finding(finding, config, client, cvss_external_resolver, logger)
             ordered_record = {field: scored.get(field) for field in OUTPUT_FIELDS}
             records.append(ordered_record)
 
         emit_output(records, Path(args.out) if args.out else None)
+        cvss_external_resolver.persist_cache()
         next_checkpoint = compute_next_checkpoint(since_value, raw_findings, run_started_at)
         write_checkpoint(checkpoint_path, next_checkpoint)
         logger.info("Checkpoint updated at %s with since=%s", checkpoint_path, next_checkpoint)
