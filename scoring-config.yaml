@@ -1,0 +1,70 @@
+version: 1
+
+semgrep:
+  base_url: "https://semgrep.dev"
+  deployments_path: "/api/v1/deployments"
+  auth_env_var: "SEMGREP_APP_TOKEN"
+  findings_path: "/api/v1/deployments/laravel_benchmark_test/findings"
+  dedup: true
+  page_size: 500
+  retry:
+    max_attempts: 5
+    backoff_ms: 400
+    max_backoff_ms: 8000
+    retry_statuses: [429, 500, 502, 503, 504]
+
+cvss:
+  version: "3.1"
+  official_cvss_candidate_paths:
+    - "cvss.vector"
+    - "vulnerability.cvss.vector"
+    - "vulnerability.cvss_v3.vector"
+  severity_to_base_vector:
+    CRITICAL: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    HIGH: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:L"
+    MEDIUM: "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:L"
+    LOW: "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:L/I:N/A:N"
+    INFO: "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N"
+  inference_overrides:
+    reachability:
+      Reachable: { AC: "L", UI: "N" }
+      Unreachable: { AC: "H", UI: "R" }
+    transitivity:
+      Direct: { PR: "N" }
+      Transitive: { PR: "L" }
+    confidence_adjustment:
+      HIGH: 1.00
+      MEDIUM: 0.92
+      LOW: 0.85
+
+epss:
+  fallback_to_first: true
+  first_api_url: "https://api.first.org/data/v1/epss"
+  timeout_seconds: 5
+
+environment:
+  default_profile: "default"
+  profiles:
+    default:
+      cvss_env: { CR: "M", IR: "M", AR: "M" }
+      modified_metrics: {}
+    prod_internet:
+      cvss_env: { CR: "H", IR: "H", AR: "H" }
+      modified_metrics: { MAV: "N", MPR: "N", MUI: "N" }
+    internal_low:
+      cvss_env: { CR: "L", IR: "L", AR: "L" }
+      modified_metrics: { MAV: "L", MPR: "H", MUI: "R" }
+  repository_profile_map:
+    - pattern: "^github\\.com/acme/prod-"
+      profile: "prod_internet"
+    - pattern: "^github\\.com/acme/internal-"
+      profile: "internal_low"
+
+priority:
+  weights:
+    cvss_base: 0.55
+    cvss_environmental: 0.25
+    epss: 0.20
+  clamp_min: 0
+  clamp_max: 100
+  round_digits: 2
