@@ -48,6 +48,121 @@ cvss:
       backoff_ms: 500
       max_backoff_ms: 6000
       retry_statuses: [429, 500, 502, 503, 504]
+  sast_inference:
+    enabled: true
+    precedence:
+      - vulnerability_classes
+      - cwe
+      - owasp
+      - keyword
+      - severity_default
+    severity_default_family:
+      CRITICAL: code_injection
+      HIGH: improper_authorization
+      MEDIUM: improper_validation
+      LOW: insecure_hashing
+      INFO: insecure_hashing
+    source_confidence_multiplier:
+      vulnerability_classes: 1.00
+      cwe: 0.96
+      owasp: 0.90
+      keyword: 0.82
+      severity_default: 0.75
+    confidence_multiplier:
+      HIGH: 1.00
+      MEDIUM: 0.92
+      LOW: 0.85
+    autotriage_multiplier:
+      true_positive: 1.05
+      false_positive: 0.65
+      none: 1.00
+    path_exposure_multiplier:
+      - pattern: "(?i)(routers|controllers|handlers|routes|api|views)"
+        multiplier: 1.10
+      - pattern: "(?i)(admin|internal|jobs|scripts|migrations|tests)"
+        multiplier: 0.90
+      - pattern: ".*"
+        multiplier: 1.00
+    family_templates:
+      sql_injection:            { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
+      command_injection:        { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
+      code_injection:           { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H" }
+      insecure_deserialization: { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" }
+      ssrf:                     { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:L" }
+      path_traversal:           { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L" }
+      improper_authorization:   { vector: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N" }
+      xss:                      { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N" }
+      csrf:                     { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N" }
+      open_redirect:            { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N" }
+      sensitive_data_exposure:  { vector: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N" }
+      dos:                      { vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H" }
+      improper_validation:      { vector: "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:L" }
+      insecure_hashing:         { vector: "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N" }
+    vulnerability_class_to_family:
+      "Server-Side Request Forgery (SSRF)": ssrf
+      "Improper Validation": improper_validation
+      "SQL Injection": sql_injection
+      "Path Traversal": path_traversal
+      "Code Injection": code_injection
+      "Command Injection": command_injection
+      "Denial-of-Service (DoS)": dos
+      "Insecure Hashing Algorithm": insecure_hashing
+      "Improper Authorization": improper_authorization
+      "Mishandled Sensitive Information": sensitive_data_exposure
+      "Cross-Site Request Forgery (CSRF)": csrf
+      "Cross-Site-Scripting (XSS)": xss
+      "Insecure Deserialization": insecure_deserialization
+      "Insecure Deserialization ": insecure_deserialization
+      "Open Redirect": open_redirect
+      "XPath Injection": code_injection
+    cwe_to_family:
+      CWE-89: sql_injection
+      CWE-78: command_injection
+      CWE-94: code_injection
+      CWE-502: insecure_deserialization
+      CWE-918: ssrf
+      CWE-22: path_traversal
+      CWE-79: xss
+      CWE-352: csrf
+      CWE-601: open_redirect
+      CWE-862: improper_authorization
+      CWE-863: improper_authorization
+      CWE-200: sensitive_data_exposure
+      CWE-201: sensitive_data_exposure
+      CWE-400: dos
+      CWE-327: insecure_hashing
+      CWE-328: insecure_hashing
+    owasp_to_family:
+      "A01:2025 - Broken Access Control": improper_authorization
+      "A03:2021 - Injection": sql_injection
+      "A10:2021 - Server-Side Request Forgery (SSRF)": ssrf
+    keyword_to_family:
+      - pattern: "(?i)sql injection|sqli"
+        family: sql_injection
+      - pattern: "(?i)command injection|os command"
+        family: command_injection
+      - pattern: "(?i)code injection|eval\\(|exec\\("
+        family: code_injection
+      - pattern: "(?i)deserialization"
+        family: insecure_deserialization
+      - pattern: "(?i)ssrf|server-side request forgery"
+        family: ssrf
+      - pattern: "(?i)path traversal|directory traversal"
+        family: path_traversal
+      - pattern: "(?i)cross-site scripting|\\bxss\\b"
+        family: xss
+      - pattern: "(?i)csrf|cross-site request forgery"
+        family: csrf
+      - pattern: "(?i)open redirect"
+        family: open_redirect
+      - pattern: "(?i)authorization|access control"
+        family: improper_authorization
+      - pattern: "(?i)sensitive data|information disclosure"
+        family: sensitive_data_exposure
+      - pattern: "(?i)denial of service|\\bdos\\b"
+        family: dos
+      - pattern: "(?i)hash|md5|sha1"
+        family: insecure_hashing
 
 epss:
   fallback_to_first: true
@@ -80,3 +195,8 @@ priority:
   clamp_min: 0
   clamp_max: 100
   round_digits: 2
+  sast_post_multipliers:
+    status:
+      open: 1.00
+      provisionally_ignored: 0.60
+      fixed: 0.25

@@ -38,6 +38,34 @@ OUTPUT_FIELDS: Sequence[str] = (
 VALID_ISSUE_TYPES = {"sast", "sca"}
 BASE_METRIC_ORDER = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
 ENV_METRIC_ORDER = ("CR", "IR", "AR", "MAV", "MAC", "MPR", "MUI", "MS", "MC", "MI", "MA")
+DEFAULT_SAST_PRECEDENCE = (
+    "vulnerability_classes",
+    "cwe",
+    "owasp",
+    "keyword",
+    "severity_default",
+)
+DEFAULT_SAST_FAMILY_TEMPLATES: Dict[str, str] = {
+    "sql_injection": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "command_injection": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "code_injection": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+    "insecure_deserialization": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "ssrf": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:L",
+    "path_traversal": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L",
+    "improper_authorization": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+    "xss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+    "csrf": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+    "open_redirect": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+    "sensitive_data_exposure": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+    "dos": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+    "improper_validation": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:L",
+    "insecure_hashing": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+}
+DEFAULT_SAST_STATUS_MULTIPLIERS: Dict[str, float] = {
+    "open": 1.0,
+    "provisionally_ignored": 0.60,
+    "fixed": 0.25,
+}
 MALICIOUS_KEYS = (
     "malicious",
     "is_malicious",
@@ -179,6 +207,31 @@ def parse_bool(value: Any) -> bool:
     return False
 
 
+def normalize_lookup_key(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    return re.sub(r"\s+", " ", token)
+
+
+def extract_cwe_id(value: Any) -> Optional[str]:
+    token = str(value or "").upper()
+    match = re.search(r"\bCWE-\d+\b", token)
+    return match.group(0) if match else None
+
+
+def as_float(value: Any, key_name: str) -> float:
+    try:
+        return float(value)
+    except Exception as exc:
+        raise CliValidationError(f"'{key_name}' must be numeric") from exc
+
+
+def as_int(value: Any, key_name: str) -> int:
+    try:
+        return int(value)
+    except Exception as exc:
+        raise CliValidationError(f"'{key_name}' must be an integer") from exc
+
+
 def validate_and_finalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     semgrep = get_required(config, "semgrep", "root")
     cvss_cfg = get_required(config, "cvss", "root")
@@ -306,6 +359,234 @@ def validate_and_finalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise CliValidationError("'cvss.external_lookup.nvd.retry_statuses' must be a non-empty list")
     nvd_cfg["retry_statuses"] = [int(code) for code in nvd_cfg["retry_statuses"]]
 
+    sast_cfg = cvss_cfg.setdefault("sast_inference", {})
+    if not isinstance(sast_cfg, dict):
+        raise CliValidationError("'cvss.sast_inference' must be a mapping")
+    sast_cfg.setdefault("enabled", False)
+    sast_cfg["enabled"] = parse_bool(sast_cfg["enabled"])
+    sast_cfg.setdefault("precedence", list(DEFAULT_SAST_PRECEDENCE))
+    if not isinstance(sast_cfg["precedence"], list) or not sast_cfg["precedence"]:
+        raise CliValidationError("'cvss.sast_inference.precedence' must be a non-empty list")
+    precedence = [str(item).strip() for item in sast_cfg["precedence"] if str(item).strip()]
+    allowed_precedence = set(DEFAULT_SAST_PRECEDENCE)
+    for item in precedence:
+        if item not in allowed_precedence:
+            raise CliValidationError(
+                f"Unsupported cvss.sast_inference.precedence entry '{item}'"
+            )
+    sast_cfg["precedence"] = precedence
+
+    default_templates = {k: normalize_cvss_vector(v, cvss_cfg["version"]) for k, v in DEFAULT_SAST_FAMILY_TEMPLATES.items()}
+    family_templates = sast_cfg.setdefault("family_templates", {})
+    if not isinstance(family_templates, dict):
+        raise CliValidationError("'cvss.sast_inference.family_templates' must be a mapping")
+    merged_templates: Dict[str, Dict[str, str]] = {}
+    all_families = set(default_templates.keys()) | set(str(k).strip() for k in family_templates.keys())
+    for family in all_families:
+        if not family:
+            continue
+        cfg_entry = family_templates.get(family)
+        if cfg_entry is None:
+            vector = default_templates.get(family)
+            if vector is None:
+                continue
+            merged_templates[family] = {"vector": vector}
+            continue
+        if isinstance(cfg_entry, dict):
+            vector_raw = cfg_entry.get("vector")
+        else:
+            vector_raw = cfg_entry
+        if not vector_raw:
+            raise CliValidationError(
+                f"'cvss.sast_inference.family_templates.{family}.vector' is required"
+            )
+        vector = normalize_cvss_vector(str(vector_raw), cvss_cfg["version"])
+        validate_cvss_vector(vector)
+        merged_templates[family] = {"vector": vector}
+    if "improper_validation" not in merged_templates:
+        raise CliValidationError(
+            "'cvss.sast_inference.family_templates' must include 'improper_validation'"
+        )
+    sast_cfg["family_templates"] = merged_templates
+
+    severity_default_family = sast_cfg.setdefault("severity_default_family", {})
+    if not isinstance(severity_default_family, dict):
+        raise CliValidationError("'cvss.sast_inference.severity_default_family' must be a mapping")
+    default_severity_family = {
+        "CRITICAL": "code_injection",
+        "HIGH": "improper_authorization",
+        "MEDIUM": "improper_validation",
+        "LOW": "insecure_hashing",
+        "INFO": "insecure_hashing",
+    }
+    normalized_severity_family: Dict[str, str] = {}
+    for severity, family in {**default_severity_family, **severity_default_family}.items():
+        severity_key = str(severity).upper().strip()
+        family_key = str(family).strip()
+        if family_key not in merged_templates:
+            raise CliValidationError(
+                f"Unknown family '{family_key}' in cvss.sast_inference.severity_default_family.{severity_key}"
+            )
+        normalized_severity_family[severity_key] = family_key
+    if "MEDIUM" not in normalized_severity_family:
+        raise CliValidationError(
+            "'cvss.sast_inference.severity_default_family' must include MEDIUM"
+        )
+    sast_cfg["severity_default_family"] = normalized_severity_family
+
+    source_conf = sast_cfg.setdefault("source_confidence_multiplier", {})
+    if not isinstance(source_conf, dict):
+        raise CliValidationError("'cvss.sast_inference.source_confidence_multiplier' must be a mapping")
+    default_source_conf = {
+        "vulnerability_classes": 1.00,
+        "cwe": 0.96,
+        "owasp": 0.90,
+        "keyword": 0.82,
+        "severity_default": 0.75,
+    }
+    normalized_source_conf: Dict[str, float] = {}
+    for source_name, default_value in default_source_conf.items():
+        normalized_source_conf[source_name] = as_float(
+            source_conf.get(source_name, default_value),
+            f"cvss.sast_inference.source_confidence_multiplier.{source_name}",
+        )
+        if normalized_source_conf[source_name] <= 0:
+            raise CliValidationError(
+                f"'cvss.sast_inference.source_confidence_multiplier.{source_name}' must be > 0"
+            )
+    sast_cfg["source_confidence_multiplier"] = normalized_source_conf
+
+    conf_multiplier = sast_cfg.setdefault("confidence_multiplier", {})
+    if not isinstance(conf_multiplier, dict):
+        raise CliValidationError("'cvss.sast_inference.confidence_multiplier' must be a mapping")
+    default_conf_multiplier = {"HIGH": 1.0, "MEDIUM": 0.92, "LOW": 0.85}
+    normalized_conf_multiplier: Dict[str, float] = {}
+    for level, default_value in default_conf_multiplier.items():
+        normalized_conf_multiplier[level] = as_float(
+            conf_multiplier.get(level, default_value),
+            f"cvss.sast_inference.confidence_multiplier.{level}",
+        )
+        if normalized_conf_multiplier[level] <= 0:
+            raise CliValidationError(
+                f"'cvss.sast_inference.confidence_multiplier.{level}' must be > 0"
+            )
+    sast_cfg["confidence_multiplier"] = normalized_conf_multiplier
+
+    autotriage_multiplier = sast_cfg.setdefault("autotriage_multiplier", {})
+    if not isinstance(autotriage_multiplier, dict):
+        raise CliValidationError("'cvss.sast_inference.autotriage_multiplier' must be a mapping")
+    default_autotriage = {"true_positive": 1.05, "false_positive": 0.65, "none": 1.00}
+    normalized_autotriage: Dict[str, float] = {}
+    for verdict, default_value in default_autotriage.items():
+        normalized_autotriage[verdict] = as_float(
+            autotriage_multiplier.get(verdict, default_value),
+            f"cvss.sast_inference.autotriage_multiplier.{verdict}",
+        )
+        if normalized_autotriage[verdict] <= 0:
+            raise CliValidationError(
+                f"'cvss.sast_inference.autotriage_multiplier.{verdict}' must be > 0"
+            )
+    sast_cfg["autotriage_multiplier"] = normalized_autotriage
+
+    path_exposure = sast_cfg.setdefault("path_exposure_multiplier", [])
+    if not isinstance(path_exposure, list) or not path_exposure:
+        raise CliValidationError("'cvss.sast_inference.path_exposure_multiplier' must be a non-empty list")
+    normalized_path_exposure: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(path_exposure):
+        if not isinstance(entry, dict):
+            raise CliValidationError(
+                f"'cvss.sast_inference.path_exposure_multiplier[{idx}]' must be a mapping"
+            )
+        pattern = str(get_required(entry, "pattern", "cvss.sast_inference.path_exposure_multiplier[]"))
+        multiplier = as_float(
+            get_required(entry, "multiplier", "cvss.sast_inference.path_exposure_multiplier[]"),
+            f"cvss.sast_inference.path_exposure_multiplier[{idx}].multiplier",
+        )
+        if multiplier <= 0:
+            raise CliValidationError(
+                f"'cvss.sast_inference.path_exposure_multiplier[{idx}].multiplier' must be > 0"
+            )
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise CliValidationError(
+                f"Invalid regex in cvss.sast_inference.path_exposure_multiplier[{idx}]: {exc}"
+            ) from exc
+        normalized_path_exposure.append({"pattern": pattern, "multiplier": multiplier})
+    sast_cfg["path_exposure_multiplier"] = normalized_path_exposure
+
+    vuln_class_map = sast_cfg.setdefault("vulnerability_class_to_family", {})
+    if not isinstance(vuln_class_map, dict):
+        raise CliValidationError("'cvss.sast_inference.vulnerability_class_to_family' must be a mapping")
+    normalized_vuln_class_map: Dict[str, str] = {}
+    for raw_key, family in vuln_class_map.items():
+        key = normalize_lookup_key(raw_key)
+        family_key = str(family).strip()
+        if not key:
+            continue
+        if family_key not in merged_templates:
+            raise CliValidationError(
+                f"Unknown family '{family_key}' in cvss.sast_inference.vulnerability_class_to_family"
+            )
+        normalized_vuln_class_map[key] = family_key
+    sast_cfg["vulnerability_class_to_family"] = normalized_vuln_class_map
+
+    cwe_map = sast_cfg.setdefault("cwe_to_family", {})
+    if not isinstance(cwe_map, dict):
+        raise CliValidationError("'cvss.sast_inference.cwe_to_family' must be a mapping")
+    normalized_cwe_map: Dict[str, str] = {}
+    for raw_key, family in cwe_map.items():
+        key = extract_cwe_id(raw_key)
+        family_key = str(family).strip()
+        if not key:
+            continue
+        if family_key not in merged_templates:
+            raise CliValidationError(
+                f"Unknown family '{family_key}' in cvss.sast_inference.cwe_to_family"
+            )
+        normalized_cwe_map[key] = family_key
+    sast_cfg["cwe_to_family"] = normalized_cwe_map
+
+    owasp_map = sast_cfg.setdefault("owasp_to_family", {})
+    if not isinstance(owasp_map, dict):
+        raise CliValidationError("'cvss.sast_inference.owasp_to_family' must be a mapping")
+    normalized_owasp_map: Dict[str, str] = {}
+    for raw_key, family in owasp_map.items():
+        key = normalize_lookup_key(raw_key)
+        family_key = str(family).strip()
+        if not key:
+            continue
+        if family_key not in merged_templates:
+            raise CliValidationError(
+                f"Unknown family '{family_key}' in cvss.sast_inference.owasp_to_family"
+            )
+        normalized_owasp_map[key] = family_key
+    sast_cfg["owasp_to_family"] = normalized_owasp_map
+
+    keyword_map = sast_cfg.setdefault("keyword_to_family", [])
+    if not isinstance(keyword_map, list):
+        raise CliValidationError("'cvss.sast_inference.keyword_to_family' must be a list")
+    normalized_keyword_map: List[Dict[str, str]] = []
+    for idx, entry in enumerate(keyword_map):
+        if not isinstance(entry, dict):
+            raise CliValidationError(
+                f"'cvss.sast_inference.keyword_to_family[{idx}]' must be a mapping"
+            )
+        pattern = str(get_required(entry, "pattern", "cvss.sast_inference.keyword_to_family[]"))
+        family_key = str(get_required(entry, "family", "cvss.sast_inference.keyword_to_family[]")).strip()
+        if family_key not in merged_templates:
+            raise CliValidationError(
+                f"Unknown family '{family_key}' in cvss.sast_inference.keyword_to_family[{idx}]"
+            )
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise CliValidationError(
+                f"Invalid regex in cvss.sast_inference.keyword_to_family[{idx}]: {exc}"
+            ) from exc
+        normalized_keyword_map.append({"pattern": pattern, "family": family_key})
+    sast_cfg["keyword_to_family"] = normalized_keyword_map
+
     epss_cfg.setdefault("fallback_to_first", True)
     epss_cfg.setdefault("first_api_url", "https://api.first.org/data/v1/epss")
     epss_cfg.setdefault("timeout_seconds", 5)
@@ -370,6 +651,34 @@ def validate_and_finalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise CliValidationError("'priority.clamp_min' cannot exceed 'priority.clamp_max'")
     if priority["round_digits"] < 0:
         raise CliValidationError("'priority.round_digits' must be >= 0")
+
+    sast_post = priority.setdefault("sast_post_multipliers", {})
+    if not isinstance(sast_post, dict):
+        raise CliValidationError("'priority.sast_post_multipliers' must be a mapping")
+    status_multiplier = sast_post.setdefault("status", {})
+    if not isinstance(status_multiplier, dict):
+        raise CliValidationError("'priority.sast_post_multipliers.status' must be a mapping")
+    normalized_status_multiplier: Dict[str, float] = {}
+    for status_key, default_value in DEFAULT_SAST_STATUS_MULTIPLIERS.items():
+        normalized_status_multiplier[status_key] = as_float(
+            status_multiplier.get(status_key, default_value),
+            f"priority.sast_post_multipliers.status.{status_key}",
+        )
+        if normalized_status_multiplier[status_key] <= 0:
+            raise CliValidationError(
+                f"'priority.sast_post_multipliers.status.{status_key}' must be > 0"
+            )
+    for extra_key, value in status_multiplier.items():
+        key = normalize_status(extra_key)
+        if key in normalized_status_multiplier:
+            continue
+        numeric = as_float(value, f"priority.sast_post_multipliers.status.{extra_key}")
+        if numeric <= 0:
+            raise CliValidationError(
+                f"'priority.sast_post_multipliers.status.{extra_key}' must be > 0"
+            )
+        normalized_status_multiplier[key] = numeric
+    sast_post["status"] = normalized_status_multiplier
 
     return config
 
@@ -503,14 +812,7 @@ def coerce_float(value: Any) -> Optional[float]:
 
 
 def bool_from_value(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        token = value.strip().lower()
-        return token in {"1", "true", "yes", "y"}
-    return False
+    return parse_bool(value)
 
 
 def extract_cve(finding: Dict[str, Any]) -> Optional[str]:
@@ -1038,6 +1340,186 @@ def infer_base_vector(
     return final_vector, applied, confidence_multiplier
 
 
+def infer_sast_base_vector(
+    finding: Dict[str, Any], cvss_cfg: Dict[str, Any]
+) -> Tuple[str, List[str], str]:
+    version = cvss_cfg["version"]
+    sast_cfg = cvss_cfg.get("sast_inference", {})
+    family_templates = sast_cfg["family_templates"]
+    precedence = sast_cfg["precedence"]
+
+    rule = finding.get("rule")
+    rule_obj = rule if isinstance(rule, dict) else {}
+    selected_family: Optional[str] = None
+    selected_source = "severity_default"
+    selected_evidence = "none"
+
+    vulnerability_class_to_family = sast_cfg.get("vulnerability_class_to_family", {})
+    cwe_to_family = sast_cfg.get("cwe_to_family", {})
+    owasp_to_family = sast_cfg.get("owasp_to_family", {})
+    keyword_to_family = sast_cfg.get("keyword_to_family", [])
+    severity_default_family = sast_cfg.get("severity_default_family", {})
+
+    for source in precedence:
+        if source == "vulnerability_classes":
+            raw_classes = rule_obj.get("vulnerability_classes")
+            if isinstance(raw_classes, list):
+                for item in raw_classes:
+                    normalized = normalize_lookup_key(item)
+                    family = vulnerability_class_to_family.get(normalized)
+                    if family:
+                        selected_family = family
+                        selected_source = source
+                        selected_evidence = normalized
+                        break
+            if selected_family:
+                break
+        elif source == "cwe":
+            raw_cwes = rule_obj.get("cwe_names")
+            if isinstance(raw_cwes, list):
+                for item in raw_cwes:
+                    cwe = extract_cwe_id(item)
+                    family = cwe_to_family.get(cwe or "")
+                    if family and cwe:
+                        selected_family = family
+                        selected_source = source
+                        selected_evidence = cwe
+                        break
+            if selected_family:
+                break
+        elif source == "owasp":
+            raw_owasp = rule_obj.get("owasp_names")
+            if isinstance(raw_owasp, list):
+                for item in raw_owasp:
+                    normalized = normalize_lookup_key(item)
+                    family = owasp_to_family.get(normalized)
+                    if family:
+                        selected_family = family
+                        selected_source = source
+                        selected_evidence = normalized
+                        break
+            if selected_family:
+                break
+        elif source == "keyword":
+            search_blob = " ".join(
+                [
+                    str(finding.get("rule_name") or ""),
+                    str(rule_obj.get("name") or ""),
+                    str(rule_obj.get("message") or ""),
+                    " ".join(str(item) for item in (rule_obj.get("vulnerability_classes") or []) if item),
+                    " ".join(str(item) for item in (rule_obj.get("cwe_names") or []) if item),
+                    " ".join(str(item) for item in (rule_obj.get("owasp_names") or []) if item),
+                ]
+            )
+            for mapping in keyword_to_family:
+                pattern = str(mapping.get("pattern") or "")
+                family = str(mapping.get("family") or "")
+                if not pattern or not family:
+                    continue
+                if re.search(pattern, search_blob):
+                    selected_family = family
+                    selected_source = source
+                    selected_evidence = f"pattern:{pattern}"
+                    break
+            if selected_family:
+                break
+        elif source == "severity_default":
+            severity = normalize_severity(finding.get("severity"))
+            selected_family = severity_default_family.get(
+                severity, severity_default_family.get("MEDIUM", "improper_validation")
+            )
+            selected_source = source
+            selected_evidence = f"severity:{severity}"
+            break
+
+    if not selected_family:
+        selected_family = severity_default_family.get("MEDIUM", "improper_validation")
+        selected_source = "severity_default"
+        selected_evidence = "severity:MEDIUM"
+
+    template_entry = family_templates.get(selected_family)
+    if not isinstance(template_entry, dict) or not template_entry.get("vector"):
+        raise CliValidationError(f"Missing vector for SAST family '{selected_family}'")
+    vector = normalize_cvss_vector(str(template_entry["vector"]), version)
+    validate_cvss_vector(vector)
+    applied = [
+        f"sast_family:{selected_family}",
+        f"sast_source:{selected_source}",
+        f"sast_evidence:{selected_evidence}",
+    ]
+    return vector, applied, selected_source
+
+
+def find_sast_path_multiplier(file_path: str, mappings: Sequence[Dict[str, Any]]) -> Tuple[float, str]:
+    for item in mappings:
+        pattern = str(item.get("pattern") or "")
+        multiplier = float(item.get("multiplier") or 1.0)
+        if pattern and re.search(pattern, file_path):
+            return multiplier, pattern
+    return 1.0, "none"
+
+
+def resolve_sast_priority_multiplier(
+    finding: Dict[str, Any],
+    config: Dict[str, Any],
+    inference_source: str,
+    scoring_method: str,
+) -> Tuple[float, List[str]]:
+    cvss_cfg = config["cvss"]
+    priority_cfg = config["priority"]
+    sast_cfg = cvss_cfg.get("sast_inference", {})
+    if not bool(sast_cfg.get("enabled", False)):
+        return 1.0, []
+
+    notes: List[str] = []
+    multiplier = 1.0
+
+    source_multiplier = 1.0
+    source_key = inference_source if scoring_method == "inferred_semgrep" else "official"
+    if scoring_method == "inferred_semgrep":
+        source_multiplier = float(
+            sast_cfg.get("source_confidence_multiplier", {}).get(inference_source, 1.0)
+        )
+        notes.append(f"sast_source_conf:{source_key}:x{source_multiplier:.2f}")
+    multiplier *= source_multiplier
+
+    finding_conf = str(
+        finding.get("confidence") or json_get_path(finding, "rule.confidence") or ""
+    ).upper()
+    confidence_multiplier = float(
+        sast_cfg.get("confidence_multiplier", {}).get(finding_conf, 1.0)
+    )
+    multiplier *= confidence_multiplier
+    notes.append(f"sast_conf:{finding_conf or 'NONE'}:x{confidence_multiplier:.2f}")
+
+    verdict = str(json_get_path(finding, "assistant.autotriage.verdict") or "none").lower()
+    autotriage_multiplier = float(
+        sast_cfg.get("autotriage_multiplier", {}).get(verdict, sast_cfg.get("autotriage_multiplier", {}).get("none", 1.0))
+    )
+    multiplier *= autotriage_multiplier
+    notes.append(f"sast_autotriage:{verdict}:x{autotriage_multiplier:.2f}")
+
+    location = finding.get("location")
+    location_obj = location if isinstance(location, dict) else {}
+    file_path = str(
+        location_obj.get("file_path") or finding.get("path") or json_get_path(finding, "location.path") or ""
+    )
+    path_multiplier, path_pattern = find_sast_path_multiplier(
+        file_path,
+        sast_cfg.get("path_exposure_multiplier", []),
+    )
+    multiplier *= path_multiplier
+    notes.append(f"sast_path:{path_pattern}:x{path_multiplier:.2f}")
+
+    status = normalize_status(finding.get("status"))
+    status_map = priority_cfg.get("sast_post_multipliers", {}).get("status", {})
+    status_multiplier = float(status_map.get(status, 1.0))
+    multiplier *= status_multiplier
+    notes.append(f"sast_status:{status}:x{status_multiplier:.2f}")
+
+    return multiplier, notes
+
+
 def select_environment_profile(
     repository: str, env_cfg: Dict[str, Any]
 ) -> Tuple[str, Dict[str, Any], Optional[str]]:
@@ -1188,13 +1670,19 @@ def process_finding(
             cvss_source = external_source
     applied_overrides: List[str] = []
     confidence_multiplier: Optional[float] = None
+    inference_source = "severity_default"
 
     if official_vector:
         scoring_method = "official_cvss"
         cvss_vector_base = official_vector
     else:
         scoring_method = "inferred_semgrep"
-        cvss_vector_base, applied_overrides, confidence_multiplier = infer_base_vector(finding, cvss_cfg)
+        if issue_type == "sast" and bool(cvss_cfg.get("sast_inference", {}).get("enabled", False)):
+            cvss_vector_base, sast_notes, inference_source = infer_sast_base_vector(finding, cvss_cfg)
+            applied_overrides.extend(sast_notes)
+        else:
+            cvss_vector_base, applied_overrides, confidence_multiplier = infer_base_vector(finding, cvss_cfg)
+            inference_source = "legacy"
 
     base_score, _, _ = cvss_scores(cvss_vector_base)
     if scoring_method == "inferred_semgrep" and confidence_multiplier is not None:
@@ -1222,6 +1710,15 @@ def process_finding(
     env_component = 100.0 * weights["cvss_environmental"] * (env_score / 10.0)
     epss_component = 100.0 * weights["epss"] * epss_effective
     raw_priority = base_component + env_component + epss_component
+    if issue_type == "sast" and bool(cvss_cfg.get("sast_inference", {}).get("enabled", False)):
+        sast_multiplier, sast_multiplier_notes = resolve_sast_priority_multiplier(
+            finding=finding,
+            config=config,
+            inference_source=inference_source,
+            scoring_method=scoring_method,
+        )
+        raw_priority *= sast_multiplier
+        applied_overrides.extend(sast_multiplier_notes)
     final_priority = round(
         clamp(raw_priority, priority_cfg["clamp_min"], priority_cfg["clamp_max"]),
         priority_cfg["round_digits"],
