@@ -4,7 +4,7 @@ semgrep:
   base_url: "https://semgrep.dev"
   deployments_path: "/api/v1/deployments"
   auth_env_var: "SEMGREP_APP_TOKEN"
-  findings_path: "/api/v1/deployments/laravel_benchmark_test/findings"
+  findings_path: "/api/v1/deployments/{deployment_slug}/findings"
   dedup: true
   page_size: 500
   retry:
