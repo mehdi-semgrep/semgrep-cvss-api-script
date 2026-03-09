@@ -23,10 +23,7 @@ OUTPUT_FIELDS: Sequence[str] = (
     "issue_type",
     "severity",
     "status",
-    "cvss_vector_base",
-    "cvss_score_base",
-    "cvss_vector_environmental",
-    "cvss_score_environmental",
+    "cvssSources",
     "epss_score",
     "epss_percentile",
     "final_priority_score",
@@ -1743,15 +1740,24 @@ def process_finding(
         contributors,
     )
 
-    return {
+    pool: List[Any] = []
+
+    def _intern(val: Any) -> int:
+        pool.append(val)
+        return len(pool) - 1
+
+    type_idx = _intern("primary")
+    vec_idx = _intern(cvss_vector_base)
+    score_idx = _intern(round(clamp(base_score, 0.0, 10.0), 2))
+    src_idx = _intern({"type": type_idx, "vector": vec_idx, "score": score_idx})
+    sources_idx = _intern([src_idx])
+
+    vuln_obj = {
         "finding_id": finding_id,
         "issue_type": issue_type,
         "severity": severity,
         "status": status,
-        "cvss_vector_base": cvss_vector_base,
-        "cvss_score_base": round(clamp(base_score, 0.0, 10.0), 2),
-        "cvss_vector_environmental": cvss_vector_environmental,
-        "cvss_score_environmental": round(clamp(env_score, 0.0, 10.0), 2),
+        "cvssSources": sources_idx,
         "epss_score": None if epss_score is None else round(epss_score, 5),
         "epss_percentile": None if epss_percentile is None else round(epss_percentile, 5),
         "final_priority_score": final_priority,
@@ -1759,6 +1765,7 @@ def process_finding(
         "rationale": rationale,
         "confidence": confidence,
     }
+    return pool, vuln_obj
 
 
 def effective_since(
@@ -1871,11 +1878,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         )
         logger.info("Fetched %s normalized candidate findings", len(raw_findings))
 
-        records: List[Dict[str, Any]] = []
+        records: List[Any] = []
         for finding in raw_findings:
-            scored = process_finding(finding, config, client, cvss_external_resolver, logger)
-            ordered_record = {field: scored.get(field) for field in OUTPUT_FIELDS}
-            records.append(ordered_record)
+            pool, vuln_obj = process_finding(finding, config, client, cvss_external_resolver, logger)
+            ordered_vuln = {field: vuln_obj.get(field) for field in OUTPUT_FIELDS}
+            records.append([pool, ordered_vuln])
 
         emit_output(records, Path(args.out) if args.out else None)
         cvss_external_resolver.persist_cache()
